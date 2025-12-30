@@ -1,0 +1,426 @@
+%% TWO-LINE-ELEMENT READER / PLOTTER
+% -------------------------------------------------------------------------
+% MODIFICATIONS FOR DOPPLER CALCULATION
+%
+%       - Added WGS84 constants and UE location setup.
+%       - Main loop modified to calculate satellite ECI/ECEF position/velocity.
+%       - Calculates relative range, radial velocity, and elevation.
+%       - Calculates Doppler shift for visible satellites.
+%       - Added plots for Doppler and Elevation vs. Time.
+%
+%       --- USER REQUEST MODIFICATIONS ---
+%       - Added second UE location (UE 2) 20km East of UE 1.
+%       - Time window set to 'Nov 16 2025 21:30 - 22:20 UTC'.
+%       - Loop and plots updated for both UE locations.
+%       - ALL TIMES CONVERTED TO UTC.
+%
+%% WORKSPACE SETUP
+clc
+clear all
+close all
+format longG
+% Add path to the Earth plotting function.
+addpath([pwd, '/PlotEarth/PlotEarth']);
+% Add path to the TLE data.
+addpath([pwd, '/TLE_Files']);
+%% LOAD PHYSICAL CONSTANTS INTO THE GLOBAL WORKSPACE
+physical_constants
+global mu
+%% DOPPLER CALCULATION SETUP
+% --- User Equipment (UE) Location 1 ---
+lat_ue1_deg = 37.4190082;  % [deg] North Office
+lon_ue1_deg = -122.0961837; % [deg] West
+alt_ue1_m =  0;       % [m] Altitude above ellipsoid (WGS84)
+% --- WGS84 Constants ---
+R_e_wgs = 6378137.0;        % WGS84 Earth radius [m]
+f_wgs = 1/298.257223563;  % WGS84 flattening
+e_sq_wgs = 2*f_wgs - f_wgs^2; % WGS84 eccentricity squared
+omega_E = 7.2921150e-5;   % Earth rotation rate [rad/s]
+c_light = 299792458;      % Speed of light [m/s]
+% --- Satellite Frequency (Assuming Iridium L-Band) ---
+f_carrier = 1620e6; % [Hz] (1620 MHz)
+% --- Convert UE 1 Lat/Lon/Alt to ECEF ---
+lat_ue1_rad = deg2rad(lat_ue1_deg);
+lon_ue1_rad = deg2rad(lon_ue1_deg);
+N_ellipsoid_1 = R_e_wgs / sqrt(1 - e_sq_wgs * sin(lat_ue1_rad)^2);
+R_ue1_ecef = [ (N_ellipsoid_1 + alt_ue1_m) * cos(lat_ue1_rad) * cos(lon_ue1_rad);
+               (N_ellipsoid_1 + alt_ue1_m) * cos(lat_ue1_rad) * sin(lon_ue1_rad);
+               (N_ellipsoid_1 * (1 - e_sq_wgs) + alt_ue1_m) * sin(lat_ue1_rad) ];
+% Velocity of UE 1 (fixed on Earth's surface) in ECEF
+V_ue1_ecef = [ -omega_E * R_ue1_ecef(2);
+                omega_E * R_ue1_ecef(1);
+                0 ];
+% --- User Equipment (UE) Location 2 (20km East of UE 1) ---
+%d_east_m = 500000; % 100 km
+
+lat_ue2_deg = 37.361845;  % [deg] North Home
+lon_ue2_deg = -122.027978; % [deg] West
+alt_ue2_m =  0;       % [m] Altitude above ellipsoid (WGS84)
+
+lat_ue2_rad = deg2rad(lat_ue1_deg);
+lon_ue2_rad = deg2rad(lon_ue1_deg);
+
+%lat_ue2_deg = lat_ue1_deg;
+%alt_ue2_m = alt_ue1_m;
+%lat_ue2_rad = deg2rad(lat_ue2_deg);
+% Calculate new longitude by moving east
+%lon_ue2_rad = lon_ue1_rad + (d_east_m / (N_ellipsoid_1 * cos(lat_ue1_rad)));
+%lon_ue2_deg = rad2deg(lon_ue2_rad);
+% --- Convert UE 2 Lat/Lon/Alt to ECEF ---
+N_ellipsoid_2 = R_e_wgs / sqrt(1 - e_sq_wgs * sin(lat_ue2_rad)^2);
+R_ue2_ecef = [ (N_ellipsoid_2 + alt_ue2_m) * cos(lat_ue2_rad) * cos(lon_ue2_rad);
+               (N_ellipsoid_2 + alt_ue2_m) * cos(lat_ue2_rad) * sin(lon_ue2_rad);
+               (N_ellipsoid_2 * (1 - e_sq_wgs) + alt_ue2_m) * sin(lat_ue2_rad) ];
+% Velocity of UE 2 (fixed on Earth's surface) in ECEF
+V_ue2_ecef = [ -omega_E * R_ue2_ecef(2);
+                omega_E * R_ue2_ecef(1);
+                0 ];
+%% SELECT THE TLE FILES TO PLOT
+filenames = {'iridium_30'};
+% Create colors for plotting.
+colors = lines(length(filenames));
+%% DECODE TLE DATA
+% Plot the Earth.
+h = plotearth('neomap', 'BlueMarble_bw', 'SampleStep', 2);
+
+% --- Time Setup (UTC) ---
+simStart = datenum('Nov 30 2025 22:38:50'); %B200
+%simStart = datenum('Dec 01 2025 00:38:50'); %B200
+
+simDurationHours = 6; % / 60; % Duration in hours
+% --- END MODIFIED ---
+
+% Compute sidereal time at sim start (for plotting snapshot).
+GMST_start = utc2gmst(datevec(simStart)); % [rad]
+% Import the TLE data.
+for k = 1:length(filenames)
+    % Get the orbital elements.
+    [coe] = two_line_elem_conv(horzcat(filenames{k}, '.txt'), 'all');
+    
+    % --- Create Legend Labels from ID and Designation ---
+    ids = coe.ID;
+    designations = coe.designation;
+    legend_labels = cell(length(ids), 1);
+    for idx = 1:length(ids)
+         legend_labels{idx} = sprintf('%s %s', strtrim(ids{idx}), strtrim(designations{idx}));
+    end
+    
+    % Find latest epoch (all others can be run up from here).
+    coeDateNums = datenum(coe.date);
+    
+    % --- Define the max time from simStart ---
+    tFinal = simDurationHours / 24; % Convert hours to days
+    
+    % Create a time vector.
+    %tSim = linspace(simStart, simStart + tFinal, 200);
+    % --- MODIFIED: Time Step Setup ---
+    time_step_seconds = 1; % Calculate every 1 second (Change to 0.1 for higher precision)
+    step_size_days = time_step_seconds / (24 * 3600); % Convert seconds to MATLAB "days"
+
+    % Create time vector using colon operator: start : step : end
+    tSim = simStart : step_size_days : (simStart + tFinal);
+    
+    % --- Allocate space for plots for BOTH UEs ---
+    RSave_eci = NaN(length(tSim), 3, length(coeDateNums)); % ECI position
+    VSave_eci = NaN(length(tSim), 3, length(coeDateNums)); % velocity
+    
+    DopplerShift_Hz_UE1 = NaN(length(tSim), length(coeDateNums));
+    Elevation_deg_UE1 = NaN(length(tSim), length(coeDateNums));
+    
+    DopplerShift_Hz_UE2 = NaN(length(tSim), length(coeDateNums));
+    Elevation_deg_UE2 = NaN(length(tSim), length(coeDateNums));
+    
+    % Earth rotation vector
+    omega_E_vec = [0; 0; omega_E];
+    
+    % --- Calculate ENU matrices (constants for the loop) ---
+    R_enu_mat_1 = [ -sin(lon_ue1_rad),                cos(lon_ue1_rad),               0;
+                    -sin(lat_ue1_rad)*cos(lon_ue1_rad), -sin(lat_ue1_rad)*sin(lon_ue1_rad), cos(lat_ue1_rad);
+                     cos(lat_ue1_rad)*cos(lon_ue1_rad),  cos(lat_ue1_rad)*sin(lon_ue1_rad), sin(lat_ue1_rad) ];
+            
+    R_enu_mat_2 = [ -sin(lon_ue2_rad),                cos(lon_ue2_rad),               0;
+                    -sin(lat_ue2_rad)*cos(lon_ue2_rad), -sin(lat_ue2_rad)*sin(lon_ue2_rad), cos(lat_ue2_rad);
+                     cos(lat_ue2_rad)*cos(lon_ue2_rad),  cos(lat_ue2_rad)*sin(lon_ue2_rad), sin(lat_ue2_rad) ];
+    
+    % Run through all satellites
+    for i = 1:length(coeDateNums) 
+        
+        % Get this satellite's ECI orbital elements from epoch
+        a = coe.a(i);
+        n_sat = sqrt(mu / a^3); % [rad/s]
+        e = coe.e(i);
+        inc = coe.i(i) * pi / 180;
+        RAAN_eci = coe.RAAN(i) * pi / 180;
+        omega = coe.omega(i) * pi / 180;
+        M_epoch = coe.M(i) * pi / 180;
+        t_epoch = coeDateNums(i);
+        
+        for j = 1:length(tSim) % For each time step
+            % --- 1. Propagate Satellite to tSim(j) ---
+            dt_sec = (tSim(j) - t_epoch) * 24 * 3600;
+            M = M_epoch + n_sat * dt_sec;
+            
+            % --- 2. Get Satellite ECI State ---
+            [R_sat_eci, V_sat_eci] = COE2RV(a, e, inc, RAAN_eci, omega, M);
+            
+            % Save ECI position for plotting
+            RSave_eci(j,:,i) = R_sat_eci';
+            VSave_eci(j,:,i) = V_sat_eci';
+            
+            % --- 3. Get GMST at current time (UTC input required) ---
+            gmst_j_rad = utc2gmst(datevec(tSim(j)));
+            
+            % --- 4. Convert Satellite State to ECEF ---
+            R_z = [ cos(gmst_j_rad), sin(gmst_j_rad), 0;
+                   -sin(gmst_j_rad), cos(gmst_j_rad), 0;
+                   0,                0,               1 ];
+            
+            R_sat_ecef = R_z * R_sat_eci;
+            V_sat_ecef = R_z * V_sat_eci - cross(omega_E_vec, R_sat_ecef);
+            
+            % --- Block for UE 1 Calculations ---
+            R_rel_1 = R_sat_ecef - R_ue1_ecef;
+            V_rel_1 = V_sat_ecef - V_ue1_ecef;
+            range_1 = norm(R_rel_1);
+            R_rel_unit_1 = R_rel_1 / range_1;
+            
+            R_rel_enu_1 = R_enu_mat_1 * R_rel_1;
+            el_rad_1 = atan2(R_rel_enu_1(3), sqrt(R_rel_enu_1(1)^2 + R_rel_enu_1(2)^2));
+            Elevation_deg_UE1(j, i) = rad2deg(el_rad_1);
+            
+            if Elevation_deg_UE1(j, i) > 20.0  % 20-degree elevation mask
+                v_r_1 = dot(V_rel_1, R_rel_unit_1);
+                DopplerShift_Hz_UE1(j, i) = f_carrier * (v_r_1 / c_light);
+            else
+                DopplerShift_Hz_UE1(j, i) = NaN; 
+            end
+            
+            % --- Block for UE 2 Calculations ---
+            R_rel_2 = R_sat_ecef - R_ue2_ecef;
+            V_rel_2 = V_sat_ecef - V_ue2_ecef;
+            range_2 = norm(R_rel_2);
+            R_rel_unit_2 = R_rel_2 / range_2;
+            
+            R_rel_enu_2 = R_enu_mat_2 * R_rel_2;
+            el_rad_2 = atan2(R_rel_enu_2(3), sqrt(R_rel_enu_2(1)^2 + R_rel_enu_2(2)^2));
+            Elevation_deg_UE2(j, i) = rad2deg(el_rad_2);
+            
+            if Elevation_deg_UE2(j, i) > 5.0  % 5-degree elevation mask
+                v_r_2 = dot(V_rel_2, R_rel_unit_2);
+                DopplerShift_Hz_UE2(j, i) = f_carrier * (v_r_2 / c_light);
+            else
+                DopplerShift_Hz_UE2(j, i) = NaN;
+            end
+            
+        end % --- End j loop (time)
+    end % --- End i loop (sats)
+    
+    % Plot the orbit
+    % for i = 1:length(coeDateNums)
+    %     % Create the rotation matrix for the plot snapshot time
+    %     R_z_plot = [ cos(GMST_start), sin(GMST_start), 0;
+    %                 -sin(GMST_start), cos(GMST_start), 0;
+    %                  0,         0,        1 ];
+    % 
+    %     % Rotate all ECI positions to ECEF *at the simStart time*
+    %     R_plot_ecef = (R_z_plot * RSave_eci(:,:,i)')';
+    % 
+    %     colorI = k;
+    %     plot3(R_plot_ecef(:,1) / R_e, R_plot_ecef(:,2) / R_e, R_plot_ecef(:,3) / R_e,...
+    %         'color', colors(colorI,:), 'LineWidth', 1)
+    %     plot3(R_plot_ecef(1,1) / R_e, R_plot_ecef(1,2) / R_e, R_plot_ecef(1,3) / R_e,...
+    %         '.', 'color', colors(colorI,:), 'MarkerSize', 10)
+    %     hold on
+    % end
+end % --- End k loop (files)
+
+%% SAVE FIGURE
+set(gcf, 'InvertHardCopy', 'on');
+view([-20, 9])
+zoom(1.25)
+ax = gca;
+ax.Clipping = 'off';
+% exportfig(gcf,horzcat(filenames{1},'Multi.tiff'),'height',6,'width',9,'fontsize',16,'LineWidth',10,'resolution',220);
+
+% --- Filter legend labels for visible satellites ---
+is_visible_UE1 = any(~isnan(DopplerShift_Hz_UE1), 1); 
+is_visible_UE2 = any(~isnan(DopplerShift_Hz_UE2), 1);
+is_visible_either = is_visible_UE1 | is_visible_UE2;
+filtered_legend_labels = legend_labels(is_visible_either);
+visible_indices = find(is_visible_either);
+
+%% ------------------------------------------------------------------------
+%  --- MODIFIED PLOTTING SECTIONS (UTC) ---
+% ------------------------------------------------------------------------
+
+% --- Use UTC time directly (No offset subtraction) ---
+% tSim is already UTC.
+tSim_Plot = tSim; 
+
+% --- Compute Doppler Difference (UE1 - UE2) ---
+DopplerDiff_Hz = DopplerShift_Hz_UE1 - DopplerShift_Hz_UE2;
+fprintf('\n--- Difference in Doppler Shift (UE1 - UE2) ---\n');
+for idx = 1:length(visible_indices)
+    sat_index = visible_indices(idx);
+    diff_this_sat = DopplerDiff_Hz(:, sat_index);
+    valid_idx = ~isnan(diff_this_sat);
+    if any(valid_idx)
+        max_diff = max(diff_this_sat(valid_idx));
+        min_diff = min(diff_this_sat(valid_idx));
+        fprintf('Satellite %s: Min diff = %.2f Hz, Max diff = %.2f Hz\n', ...
+            legend_labels{sat_index}, min_diff, max_diff);
+    else
+        fprintf('Satellite %s: No time points where both UEs had valid Doppler\n', legend_labels{sat_index});
+    end
+end
+
+%% PLOT DOPPLER INFORMATION (UE 1)
+figure;
+hold on;
+for idx = 1:length(visible_indices)
+    sat_index = visible_indices(idx);
+    plot(tSim_Plot, DopplerShift_Hz_UE1(:, sat_index) / 1e3, ...
+         'DisplayName', legend_labels{sat_index});
+end
+hold off;
+grid on;
+datetick('x', 'HH:MM:SS'); 
+xlabel('Time (UTC)'); % Label changed
+ylabel('Doppler Shift (kHz)');
+title(sprintf('UE 1 Doppler Shift for %s at %.2f°N, %.2f°W (f_0=%.2f MHz)', ...
+    filenames{1}, lat_ue1_deg, -lon_ue1_deg, f_carrier/1e6));
+legend('Location', 'best');
+
+%% PLOT ELEVATION (UE 1)
+figure;
+hold on;
+for idx = 1:length(visible_indices)
+    sat_index = visible_indices(idx);
+    plot(tSim_Plot, Elevation_deg_UE1(:, sat_index), ...
+         'DisplayName', legend_labels{sat_index});
+end
+hold off;
+grid on;
+datetick('x', 'HH:MM:SS');
+xlabel('Time (UTC)'); % Label changed
+ylabel('Elevation Angle (degrees)');
+title(sprintf('UE 1 Elevation for %s at %.2f°N, %.2f°W', ...
+    filenames{1}, lat_ue1_deg, -lon_ue1_deg));
+legend('Location', 'best');
+
+%% PLOT DOPPLER INFORMATION (UE 2)
+figure;
+hold on;
+for idx = 1:length(visible_indices)
+    sat_index = visible_indices(idx);
+    plot(tSim_Plot, DopplerShift_Hz_UE2(:, sat_index) / 1e3, ...
+         'DisplayName', legend_labels{sat_index});
+end
+hold off;
+grid on;
+datetick('x', 'HH:MM:SS');
+xlabel('Time (UTC)'); % Label changed
+ylabel('Doppler Shift (kHz)');
+title(sprintf('UE 2 (20km East) Doppler Shift for %s at %.4f°N, %.4f°W (f_0=%.2f MHz)', ...
+    filenames{1}, lat_ue2_deg, -lon_ue2_deg, f_carrier/1e6));
+legend('Location', 'best');
+
+%% PLOT ELEVATION (UE 2)
+figure;
+hold on;
+for idx = 1:length(visible_indices)
+    sat_index = visible_indices(idx);
+    plot(tSim_Plot, Elevation_deg_UE2(:, sat_index), ...
+         'DisplayName', legend_labels{sat_index});
+end
+hold off;
+grid on;
+datetick('x', 'HH:MM:SS');
+xlabel('Time (UTC)'); % Label changed
+ylabel('Elevation Angle (degrees)');
+title(sprintf('UE 2 (20km East) Elevation for %s at %.4f°N, %.4f°W', ...
+    filenames{1}, lat_ue2_deg, -lon_ue2_deg));
+legend('Location', 'best');
+
+%% PLOT DOPPLER DIFFERENCE (UE1 - UE2)
+figure;
+hold on;
+for idx = 1:length(visible_indices)
+    sat_index = visible_indices(idx);
+    plot(tSim_Plot, DopplerDiff_Hz(:, sat_index) / 1e3, ...
+        'DisplayName', legend_labels{sat_index});
+end
+hold off;
+grid on;
+datetick('x', 'HH:MM:SS');
+xlabel('Time (UTC)'); % Label changed
+ylabel('Doppler Diff (kHz)');
+title('Doppler Difference (UE1 - UE2) for Visible Satellites');
+legend('Location', 'best');
+hold off;
+
+%% ------------------------------------------------------------------------
+%  --- DATA EXPORT FOR PYTHON ---
+% ------------------------------------------------------------------------
+fprintf('Saving data for Python import...\n');
+
+exportData = struct();
+exportData.time_utc_datenum = tSim;
+exportData.time_description = 'MATLAB datenum vector (UTC). Use python datetime.fromordinal() + timedelta to convert.';
+exportData.satellite_names = legend_labels;
+exportData.satellite_indices_description = 'The Nth satellite name in satellite_names corresponds to the Nth column in observation data and the Nth "page" in state_data.';
+exportData.position_eci_m = RSave_eci;
+exportData.velocity_eci_m_s = VSave_eci;
+exportData.state_data_description = 'ECI state data. Dimensions are (Time, [X,Y,Z], Satellite_Index).';
+exportData.state_data_dimensions = '[number_of_timesteps, 3, number_of_satellites]';
+exportData.elevation_ue1_deg = Elevation_deg_UE1;
+exportData.doppler_ue1_hz = DopplerShift_Hz_UE1;
+exportData.elevation_ue2_deg = Elevation_deg_UE2;
+exportData.doppler_ue2_hz = DopplerShift_Hz_UE2;
+exportData.observation_data_description = 'Observation data. Dimensions are (Time, Satellite_Index).';
+exportData.observation_data_dimensions = '[number_of_timesteps, number_of_satellites]';
+exportData.ue1_location_deg_m = [lat_ue1_deg; lon_ue1_deg; alt_ue1_m];
+exportData.ue2_location_deg_m = [lat_ue2_deg; lon_ue2_deg; alt_ue2_m];
+exportData.location_description = '[Latitude (deg N), Longitude (deg W), Altitude (m)]';
+exportData.doppler_diff_hz = DopplerDiff_Hz;
+exportData.doppler_diff_description = 'Doppler difference (UE1 - UE2), [Hz]: (Time, Satellite_Index)';
+
+% Save as a .mat file
+save('satellite_simulation_data.mat', 'exportData', '-v7');
+fprintf('Data successfully saved to satellite_simulation_data.mat\n');
+
+%% SAVE TO CSV (UE1 and UE2)
+
+% 1. Clean up the names (Make them valid variable names for headers)
+% This replaces spaces with underscores: "IRIDIUM 100" -> "IRIDIUM_100"
+clean_labels = matlab.lang.makeValidName(filtered_legend_labels);
+
+% --- SAVE UE 1 ---
+% Filter data to match the visible list
+visible_data_ue1 = DopplerShift_Hz_UE1(:, visible_indices);
+
+% Create Table
+T_UE1 = array2table(visible_data_ue1, 'VariableNames', clean_labels);
+
+% Add Time Column
+T_UE1.Time_UTC = datestr(tSim', 'yyyy-mm-dd HH:MM:SS');
+T_UE1 = movevars(T_UE1, 'Time_UTC', 'Before', 1);
+
+% Write to CSV
+writetable(T_UE1, 'ue1_doppler_data.csv');
+fprintf('Saved ue1_doppler_data.csv\n');
+
+% --- SAVE UE 2 ---
+% Filter data to match the SAME visible list (Keeps columns aligned with UE1)
+visible_data_ue2 = DopplerShift_Hz_UE2(:, visible_indices);
+
+% Create Table
+T_UE2 = array2table(visible_data_ue2, 'VariableNames', clean_labels);
+
+% Add Time Column
+T_UE2.Time_UTC = datestr(tSim', 'yyyy-mm-dd HH:MM:SS');
+T_UE2 = movevars(T_UE2, 'Time_UTC', 'Before', 1);
+
+% Write to CSV
+writetable(T_UE2, 'ue2_doppler_data.csv');
+fprintf('Saved ue2_doppler_data.csv\n');
